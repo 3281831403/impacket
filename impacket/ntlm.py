@@ -270,6 +270,37 @@ class AV_PAIRS:
 
         return ans
 
+# [MS-NLMP] 2.2.1.3: the payload of the NTLMSSP messages is a sequence of byte ranges pointed
+# to by (length, maxlength, offset) tuples. Payload items can be present in any order within
+# the Payload field, with variable-length padding before or after the data. When parsing, the
+# offsets/lengths cannot be trusted blindly: they must lie fully inside the message, past the
+# fixed header, and must not overlap each other.
+def _check_payload_range(data, offset, length, field_name, message_name, header_end):
+    if offset < header_end:
+        raise Exception('%s: %s payload (offset %d, length %d) points into the fixed header '
+                        '(%d bytes)' % (message_name, field_name, offset, length, header_end))
+    if offset + length > len(data):
+        raise Exception('%s: %s payload (offset %d, length %d) points outside the message '
+                        '(%d bytes)' % (message_name, field_name, offset, length, len(data)))
+
+
+def _get_payload_bytes(data, offset, length, field_name, message_name, header_end):
+    if length == 0:
+        return b''
+    _check_payload_range(data, offset, length, field_name, message_name, header_end)
+    return data[offset:offset + length]
+
+
+def _check_payload_overlap(segments, message_name):
+    # segments: list of (offset, length, field_name) tuples, zero-length ones are ignored
+    ordered = sorted((offset, length, name) for offset, length, name in segments if length > 0)
+    for (prev_offset, prev_length, prev_name), (offset, length, name) in zip(ordered, ordered[1:]):
+        if offset < prev_offset + prev_length:
+            raise Exception('%s: %s payload (offset %d, length %d) overlaps %s payload '
+                            '(offset %d, length %d)' % (message_name, name, offset, length,
+                                                        prev_name, prev_offset, prev_length))
+
+
 # [MS-NLMP] 2.2.2.10 VERSION
 # https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-nlmp/b1a6ceb2-f8ad-462b-b5af-f18527c48175
 class VERSION(Structure):
@@ -327,6 +358,10 @@ class NTLMAuthNegotiate(Structure):
         return (self['flags'] & NTLMSSP_NEGOTIATE_VERSION) == NTLMSSP_NEGOTIATE_VERSION
 
     def getData(self):
+        if self.data is not None:
+            # Parsed from the wire and untouched since: return the original bytes so
+            # anything computed over them (e.g. a MIC) stays valid
+            return self.data
         if len(self.fields['host_name']) > 0:
             self['flags'] |= NTLMSSP_NEGOTIATE_OEM_WORKSTATION_SUPPLIED
         if len(self.fields['domain_name']) > 0:
@@ -345,18 +380,26 @@ class NTLMAuthNegotiate(Structure):
     def fromString(self,data):
         Structure.fromString(self,data)
 
-        domain_offset = self['domain_offset']
-        domain_end    = self['domain_len'] + domain_offset
-        self['domain_name'] = data[ domain_offset : domain_end ]
-
-        host_offset = self['host_offset']
-        host_end    = self['host_len'] + host_offset
-        self['host_name'] = data[ host_offset : host_end ]
-
-        if len(data) >= 36 and self.__hasNegotiateVersion():
+        if self.__hasNegotiateVersion():
+            if len(data) < 40:
+                raise Exception('NTLMSSP NEGOTIATE_MESSAGE: NTLMSSP_NEGOTIATE_VERSION is set but the '
+                                'message is too short (%d bytes)' % len(data))
             self['os_version'] = VERSION(data[32:])
+            header_end = 40
         else:
             self['os_version'] = ''
+            header_end = 32
+
+        self['domain_name'] = _get_payload_bytes(data, self['domain_offset'], self['domain_len'],
+                                                 'domain_name', 'NTLMSSP NEGOTIATE_MESSAGE', header_end)
+        self['host_name'] = _get_payload_bytes(data, self['host_offset'], self['host_len'],
+                                               'host_name', 'NTLMSSP NEGOTIATE_MESSAGE', header_end)
+        _check_payload_overlap([(self['domain_offset'], self['domain_len'], 'domain_name'),
+                                (self['host_offset'], self['host_len'], 'host_name')],
+                               'NTLMSSP NEGOTIATE_MESSAGE')
+
+        # Keep the original bytes: re-encoding the message must reproduce them exactly
+        self.data = data
 
 class NTLMAuthChallenge(Structure):
 
@@ -385,6 +428,10 @@ class NTLMAuthChallenge(Structure):
         return 8
 
     def getData(self):
+        if self.data is not None:
+            # Parsed from the wire and untouched since: return the original bytes so
+            # anything computed over them (e.g. a MIC) stays valid
+            return self.data
         if self['TargetInfoFields'] is not None and type(self['TargetInfoFields']) is not bytes:
             raw_av_fields = self['TargetInfoFields'].getData()
             self['TargetInfoFields'] = raw_av_fields
@@ -392,8 +439,27 @@ class NTLMAuthChallenge(Structure):
 
     def fromString(self,data):
         Structure.fromString(self,data)
-        self['domain_name'] = data[self['domain_offset']:][:self['domain_len']]
-        self['TargetInfoFields'] = data[self['TargetInfoFields_offset']:][:self['TargetInfoFields_len']]
+
+        if self['flags'] is not None and self['flags'] & NTLMSSP_NEGOTIATE_VERSION:
+            if len(data) < 56:
+                raise Exception('NTLMSSP CHALLENGE_MESSAGE: NTLMSSP_NEGOTIATE_VERSION is set but the '
+                                'message is too short (%d bytes)' % len(data))
+            header_end = 56
+        else:
+            header_end = 48
+
+        self['domain_name'] = _get_payload_bytes(data, self['domain_offset'], self['domain_len'],
+                                                 'domain_name', 'NTLMSSP CHALLENGE_MESSAGE', header_end)
+        self['TargetInfoFields'] = _get_payload_bytes(data, self['TargetInfoFields_offset'],
+                                                      self['TargetInfoFields_len'], 'TargetInfoFields',
+                                                      'NTLMSSP CHALLENGE_MESSAGE', header_end)
+        _check_payload_overlap([(self['domain_offset'], self['domain_len'], 'domain_name'),
+                                (self['TargetInfoFields_offset'], self['TargetInfoFields_len'],
+                                 'TargetInfoFields')],
+                               'NTLMSSP CHALLENGE_MESSAGE')
+
+        # Keep the original bytes: re-encoding the message must reproduce them exactly
+        self.data = data
         return self
         
 class NTLMAuthChallengeResponse(Structure):
@@ -420,9 +486,9 @@ class NTLMAuthChallengeResponse(Structure):
         ('session_key_max_len','<H-session_key'),
         ('session_key_offset','<L'),
         ('flags','<L'),
-        ('VersionLen','_-Version','self.checkVersion(self["flags"])'), 
+        ('VersionLen','_-Version','self.checkVersion(self["flags"])'),
         ('Version',':=""'),
-        ('MICLen','_-MIC','self.checkMIC(self["flags"])'),
+        ('MICLen','_-MIC','self.checkMICLayout()'),
         ('MIC',':=""'),
         ('domain_name',':'),
         ('user_name',':'),
@@ -474,13 +540,39 @@ class NTLMAuthChallengeResponse(Structure):
 
     @staticmethod
     def checkMIC(flags):
-        # TODO: Find a proper way to check the MIC is in there
+        # Used when building a new message: room for the MIC is reserved whenever
+        # the VERSION field is present. Do not use this to decide whether a parsed
+        # message carries a MIC, use checkMICLayout() instead.
         if flags is not None:
            if flags & NTLMSSP_NEGOTIATE_VERSION == 0:
               return 0
         return 16
-                                                                                
+
+    def checkMICLayout(self):
+        # [MS-NLMP] 2.2.1.3: no flag tells whether the MIC is present in an
+        # AUTHENTICATE_MESSAGE. When it is, it occupies the 16 bytes right after the
+        # fixed header (and the VERSION, if any), so its presence can only be told
+        # from the actual message layout: a gap of at least 16 bytes between the end
+        # of the fixed header and the start of the payload.
+        data = self.rawData
+        if data is None:
+            return 0
+        header_end = 64 + self.checkVersion(self['flags'])
+        payload_start = len(data)
+        for len_field, offset_field in (('lanman_len', 'lanman_offset'), ('ntlm_len', 'ntlm_offset'),
+                                        ('domain_len', 'domain_offset'), ('user_len', 'user_offset'),
+                                        ('host_len', 'host_offset'), ('session_key_len', 'session_key_offset')):
+            if self[len_field] > 0:
+                payload_start = min(payload_start, self[offset_field])
+        if payload_start - header_end >= 16:
+            return 16
+        return 0
+
     def getData(self):
+        if self.data is not None:
+            # Parsed from the wire and untouched since: return the original bytes so
+            # anything computed over them (e.g. a MIC) stays valid
+            return self.data
         self['domain_offset']=64+self.checkMIC(self["flags"])+self.checkVersion(self["flags"])
         self['user_offset']=64+self.checkMIC(self["flags"])+self.checkVersion(self["flags"])+len(self['domain_name'])
         self['host_offset']=self['user_offset']+len(self['user_name'])
@@ -492,28 +584,37 @@ class NTLMAuthChallengeResponse(Structure):
     def fromString(self,data):
         Structure.fromString(self,data)
         # [MS-NLMP] page 27
-        # Payload data can be present in any order within the Payload field, 
+        # Payload data can be present in any order within the Payload field,
         # with variable-length padding before or after the data
 
-        domain_offset = self['domain_offset']
-        domain_end = self['domain_len'] + domain_offset
-        self['domain_name'] = data[ domain_offset : domain_end ]
+        if self['flags'] is not None and self['flags'] & NTLMSSP_NEGOTIATE_VERSION and len(data) < 72:
+            raise Exception('NTLMSSP AUTHENTICATE_MESSAGE: NTLMSSP_NEGOTIATE_VERSION is set but the '
+                            'message is too short (%d bytes)' % len(data))
 
-        host_offset = self['host_offset']
-        host_end    = self['host_len'] + host_offset
-        self['host_name'] = data[ host_offset: host_end ]
+        header_end = 64 + self.checkVersion(self['flags']) + self['MICLen']
 
-        user_offset = self['user_offset']
-        user_end    = self['user_len'] + user_offset
-        self['user_name'] = data[ user_offset: user_end ]
+        self['domain_name'] = _get_payload_bytes(data, self['domain_offset'], self['domain_len'],
+                                                 'domain_name', 'NTLMSSP AUTHENTICATE_MESSAGE', header_end)
+        self['user_name'] = _get_payload_bytes(data, self['user_offset'], self['user_len'],
+                                               'user_name', 'NTLMSSP AUTHENTICATE_MESSAGE', header_end)
+        self['host_name'] = _get_payload_bytes(data, self['host_offset'], self['host_len'],
+                                               'host_name', 'NTLMSSP AUTHENTICATE_MESSAGE', header_end)
+        self['lanman'] = _get_payload_bytes(data, self['lanman_offset'], self['lanman_len'],
+                                            'lanman', 'NTLMSSP AUTHENTICATE_MESSAGE', header_end)
+        self['ntlm'] = _get_payload_bytes(data, self['ntlm_offset'], self['ntlm_len'],
+                                          'ntlm', 'NTLMSSP AUTHENTICATE_MESSAGE', header_end)
+        self['session_key'] = _get_payload_bytes(data, self['session_key_offset'], self['session_key_len'],
+                                                 'session_key', 'NTLMSSP AUTHENTICATE_MESSAGE', header_end)
+        _check_payload_overlap([(self['domain_offset'], self['domain_len'], 'domain_name'),
+                                (self['user_offset'], self['user_len'], 'user_name'),
+                                (self['host_offset'], self['host_len'], 'host_name'),
+                                (self['lanman_offset'], self['lanman_len'], 'lanman'),
+                                (self['ntlm_offset'], self['ntlm_len'], 'ntlm'),
+                                (self['session_key_offset'], self['session_key_len'], 'session_key')],
+                               'NTLMSSP AUTHENTICATE_MESSAGE')
 
-        ntlm_offset = self['ntlm_offset'] 
-        ntlm_end    = self['ntlm_len'] + ntlm_offset 
-        self['ntlm'] = data[ ntlm_offset : ntlm_end ]
-
-        lanman_offset = self['lanman_offset'] 
-        lanman_end    = self['lanman_len'] + lanman_offset
-        self['lanman'] = data[ lanman_offset : lanman_end]
+        # Keep the original bytes: re-encoding the message must reproduce them exactly
+        self.data = data
 
     def getUserString(self):
         if self['flags'] & NTLMSSP_NEGOTIATE_UNICODE:

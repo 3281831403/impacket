@@ -392,5 +392,170 @@ class NTLMTests(unittest.TestCase):
         self.assertRaises(Exception, negoMsgToPack.getData)
 
 
+class NTLMSSPMessageLayoutTests(unittest.TestCase):
+    """
+    Fixed-byte vectors for the NTLMSSP message parser.
+
+    [MS-NLMP] 2.2.1.3 allows the payload items to appear in any order within the Payload
+    field, with variable-length padding before or after the data. Decoding a message and
+    encoding it back must reproduce the exact same bytes (e.g. so a MIC computed over the
+    re-encoded messages stays valid), and malformed offsets/lengths must be rejected.
+    """
+
+    # AUTHENTICATE_MESSAGE (type 3), no VERSION, no MIC, payload items stored out of
+    # order: session_key @64, ntlm @80, lanman @104, host @128, user @136, domain @144
+    TYPE3_REORDERED_PAYLOAD = bytes.fromhex(
+        '4e544c4d535350000300000018001800'
+        '68000000180018005000000006000600'
+        '90000000080008008800000008000800'
+        '800000001000100040000000078208e0'
+        '101112131415161718191a1b1c1d1e1f'
+        '303132333435363738393a3b3c3d3e3f'
+        '40414243444546475051525354555657'
+        '58595a5b5c5d5e5f6061626364656667'
+        '48004f00530054005500530045005200'
+        '44004f004d00'
+    )
+
+    # CHALLENGE_MESSAGE (type 2) with VERSION and alignment padding around the payload:
+    # 8 padding bytes after the fixed header, domain @64, 2 padding bytes, TargetInfo @96
+    TYPE2_PADDED_PAYLOAD = bytes.fromhex(
+        '4e544c4d53535000020000001e001e00'
+        '4000000015828a62299318153d3b0d8a'
+        '00000000000000000e000e0060000000'
+        '0601b11d0000000fabababababababab'
+        '570049004e002d00410036004b005000'
+        '5500300054003100520036005300cdcd'
+        '0200060044004f004d0000000000'
+    )
+
+    # NEGOTIATE_MESSAGE (type 1) with VERSION and padding around the payload:
+    # 8 padding bytes after the fixed header, host @48, 4 padding bytes, domain @60
+    TYPE1_PADDED_PAYLOAD = bytes.fromhex(
+        '4e544c4d535350000100000001320802'
+        '060006003c0000000800080030000000'
+        '0a00414a0000000fabababababababab'
+        '5700530030003100cdcdcdcd44004f00'
+        '4d00'
+    )
+
+    # AUTHENTICATE_MESSAGE (type 3) with the NTLMSSP_NEGOTIATE_VERSION flag set and a
+    # VERSION structure, but no MIC: the payload starts right after VERSION (@72)
+    TYPE3_VERSION_NO_MIC = bytes.fromhex(
+        '4e544c4d535350000300000018001800'
+        '5e000000180018007600000006000600'
+        '48000000080008004e00000008000800'
+        '56000000100010008e000000078208e2'
+        '0a00414a0000000f44004f004d005500'
+        '53004500520048004f00530054005051'
+        '52535455565758595a5b5c5d5e5f6061'
+        '62636465666730313233343536373839'
+        '3a3b3c3d3e3f40414243444546471011'
+        '12131415161718191a1b1c1d1e1f'
+    )
+
+    # Same message, this time carrying a MIC (16 bytes, 0xa0..0xaf) between VERSION
+    # and the payload, which now starts @88
+    TYPE3_VERSION_WITH_MIC = bytes.fromhex(
+        '4e544c4d535350000300000018001800'
+        '6e000000180018008600000006000600'
+        '58000000080008005e00000008000800'
+        '66000000100010009e000000078208e2'
+        '0a00414a0000000fa0a1a2a3a4a5a6a7'
+        'a8a9aaabacadaeaf44004f004d005500'
+        '53004500520048004f00530054005051'
+        '52535455565758595a5b5c5d5e5f6061'
+        '62636465666730313233343536373839'
+        '3a3b3c3d3e3f40414243444546471011'
+        '12131415161718191a1b1c1d1e1f'
+    )
+
+    LANMAN = bytes(range(0x50, 0x50 + 24))
+    NTLM_RESPONSE = bytes(range(0x30, 0x30 + 24))
+    SESSION_KEY = bytes(range(0x10, 0x10 + 16))
+    MIC = bytes(range(0xa0, 0xa0 + 16))
+
+    def test_type3_reordered_payload_roundtrip(self):
+        message = ntlm.NTLMAuthChallengeResponse()
+        message.fromString(self.TYPE3_REORDERED_PAYLOAD)
+
+        self.assertEqual(message['domain_name'], 'DOM'.encode('utf-16le'))
+        self.assertEqual(message['user_name'], 'USER'.encode('utf-16le'))
+        self.assertEqual(message['host_name'], 'HOST'.encode('utf-16le'))
+        self.assertEqual(message['lanman'], self.LANMAN)
+        self.assertEqual(message['ntlm'], self.NTLM_RESPONSE)
+        self.assertEqual(message['session_key'], self.SESSION_KEY)
+        self.assertEqual(message['MIC'], b'')
+        self.assertEqual(message['MICLen'], 0)
+
+        # Re-encoding must reproduce the captured bytes, not a re-laid-out message
+        self.assertEqual(message.getData(), self.TYPE3_REORDERED_PAYLOAD)
+
+    def test_padded_payload_roundtrip(self):
+        message = ntlm.NTLMAuthChallenge()
+        message.fromString(self.TYPE2_PADDED_PAYLOAD)
+
+        self.assertEqual(message['domain_name'], 'WIN-A6KPU0T1R6S'.encode('utf-16le'))
+        self.assertEqual(message['TargetInfoFields'],
+                         struct.pack('<HH', ntlm.NTLMSSP_AV_DOMAINNAME, 6) +
+                         'DOM'.encode('utf-16le') + b'\x00' * 4)
+        self.assertEqual(message.getData(), self.TYPE2_PADDED_PAYLOAD)
+
+        message = ntlm.NTLMAuthNegotiate()
+        message.fromString(self.TYPE1_PADDED_PAYLOAD)
+
+        self.assertEqual(message['domain_name'], 'DOM'.encode('utf-16le'))
+        self.assertEqual(message['host_name'], 'WS01'.encode('utf-16le'))
+        self.assertEqual(message['os_version']['ProductMajorVersion'], 10)
+        self.assertEqual(message['os_version']['ProductBuild'], 19009)
+        self.assertEqual(message.getData(), self.TYPE1_PADDED_PAYLOAD)
+
+    def test_type3_version_without_mic_roundtrip(self):
+        message = ntlm.NTLMAuthChallengeResponse()
+        message.fromString(self.TYPE3_VERSION_NO_MIC)
+
+        # The VERSION flag must not be taken as proof of a MIC: there is none here,
+        # so the MIC must not be filled with the first 16 payload bytes
+        self.assertEqual(message['MIC'], b'')
+        self.assertEqual(message['MICLen'], 0)
+        self.assertEqual(message['domain_name'], 'DOM'.encode('utf-16le'))
+        self.assertEqual(message['user_name'], 'USER'.encode('utf-16le'))
+        self.assertEqual(message['host_name'], 'HOST'.encode('utf-16le'))
+        self.assertEqual(message['lanman'], self.LANMAN)
+        self.assertEqual(message['ntlm'], self.NTLM_RESPONSE)
+        self.assertEqual(message['session_key'], self.SESSION_KEY)
+        self.assertEqual(message.getData(), self.TYPE3_VERSION_NO_MIC)
+
+        # Same layout with an actual MIC: it must be detected from the layout
+        message = ntlm.NTLMAuthChallengeResponse()
+        message.fromString(self.TYPE3_VERSION_WITH_MIC)
+
+        self.assertEqual(message['MIC'], self.MIC)
+        self.assertEqual(message['MICLen'], 16)
+        self.assertEqual(message['session_key'], self.SESSION_KEY)
+        self.assertEqual(message.getData(), self.TYPE3_VERSION_WITH_MIC)
+
+    def test_malformed_payload_layout_raises(self):
+        # session_key offset past the end of the message
+        data = bytearray(self.TYPE3_VERSION_NO_MIC)
+        data[56:60] = struct.pack('<L', 200)
+        self.assertRaises(Exception, ntlm.NTLMAuthChallengeResponse().fromString, bytes(data))
+
+        # ntlm response overlapping the lanman response
+        data = bytearray(self.TYPE3_VERSION_NO_MIC)
+        data[24:28] = struct.pack('<L', 100)
+        self.assertRaises(Exception, ntlm.NTLMAuthChallengeResponse().fromString, bytes(data))
+
+        # domain payload pointing into the fixed header
+        data = bytearray(self.TYPE3_VERSION_NO_MIC)
+        data[32:36] = struct.pack('<L', 40)
+        self.assertRaises(Exception, ntlm.NTLMAuthChallengeResponse().fromString, bytes(data))
+
+        # TargetInfo past the end of a CHALLENGE_MESSAGE
+        data = bytearray(self.TYPE2_PADDED_PAYLOAD)
+        data[40:44] = struct.pack('<L', 200)
+        self.assertRaises(Exception, ntlm.NTLMAuthChallenge().fromString, bytes(data))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=1)
