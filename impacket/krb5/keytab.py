@@ -1,6 +1,6 @@
 # Impacket - Collection of Python classes for working with network protocols.
 #
-# Copyright Fortra, LLC and its affiliated companies 
+# Copyright Fortra, LLC and its affiliated companies
 #
 # All rights reserved.
 #
@@ -22,7 +22,7 @@ from datetime import datetime
 from enum import Enum
 from six import b
 
-from struct import pack, unpack, calcsize
+from struct import pack, unpack
 from binascii import hexlify
 
 from impacket.structure import Structure
@@ -79,6 +79,13 @@ class KeytabPrincipal:
       * `num_components` is just uint16
       * using other size type for CountedOctetString
       * `name_type` field follows the other fields behind.
+
+    The layout depends on the keytab file format version:
+      * version 0x501: `num_components` counts the realm as well (i.e. the
+        actual number of components is `num_components` - 1) and there is
+        no `name_type` field.
+      * version 0x502: `num_components` is the actual number of components
+        and a uint32 `name_type` field follows the components.
     """
     class PrincipalHeader1(Structure):
         structure = (
@@ -90,35 +97,52 @@ class KeytabPrincipal:
             ('name_type', '!L=0'),
         )
 
-    def __init__(self, data=None):
+    def __init__(self, data=None, version=0x502):
+        self.version = version
         self.components = []
         self.realm = None
         if data is not None:
             self.header1 = self.PrincipalHeader1(data)
             data = data[len(self.header1):]
+            num_components = self.header1['num_components']
+            if version == 0x501:
+                # In the 0x501 format the realm is included in the count
+                num_components -= 1
             self.realm = CountedOctetString(data)
             data = data[len(self.realm):]
             self.components = []
-            for component in range(self.header1['num_components']):
+            for component in range(num_components):
                 comp = CountedOctetString(data)
                 data = data[len(comp):]
                 self.components.append(comp)
-            self.header2 = self.PrincipalHeader2(data)
+            if version == 0x501:
+                # No name_type field in the 0x501 format
+                self.header2 = None
+            else:
+                self.header2 = self.PrincipalHeader2(data)
         else:
             self.header1 = self.PrincipalHeader1()
-            self.header2 = self.PrincipalHeader2()
+            self.header2 = None if version == 0x501 else self.PrincipalHeader2()
 
     def __len__(self):
-        totalLen = len(self.header1) + len(self.header2) + len(self.realm)
+        totalLen = len(self.header1) + len(self.realm)
+        if self.header2 is not None:
+            totalLen += len(self.header2)
         for i in self.components:
             totalLen += len(i)
         return totalLen
 
     def getData(self):
+        if self.version == 0x501:
+            # In the 0x501 format the realm is included in the count
+            self.header1['num_components'] = len(self.components) + 1
+        else:
+            self.header1['num_components'] = len(self.components)
         data = self.header1.getData() + self.realm.getData()
         for component in self.components:
             data += component.getData()
-        data += self.header2.getData()
+        if self.header2 is not None:
+            data += self.header2.getData()
         return data
 
     def __str__(self):
@@ -143,64 +167,73 @@ class KeytabPrincipal:
 
 
 class KeytabEntry:
-    class KeytabEntryMainpart(Structure):
-        """
+    """
       keytab_entry {
-          int32_t size;     # wtf, signed size. what could possibly ...
+          int32_t size;     /* negative when the entry was deleted */
           uint16_t num_components;    /* sub 1 if version 0x501 */  |\
           counted_octet_string realm;                               | \\  Keytab
-          counted_octet_string components[num_components];          | /  Princial
+          counted_octet_string components[num_components];          | /  Principal
           uint32_t name_type;   /* not present if version 0x501 */  |/
           uint32_t timestamp;
           uint8_t vno8;
           keyblock key;
           uint32_t vno; /* only present if >= 4 bytes left in entry */
       };
-        """
-        structure = (
-            ('size', '!l=0'),
-            ('principal', ':', KeytabPrincipal),
-            ('timestamp', '!L=0'),
-            ('vno8', '!B=0'),
-            ('keyblock', ':', KeyBlock),
-        )
+    """
 
-    def __init__(self, data=None):
+    def __init__(self, data=None, version=0x502):
+        self.version = version
         self.rest = b''
-        if data:
-            self.main_part = self.KeytabEntryMainpart(data)
-            self.size = abs(self.main_part['size']) + 4  # size field itself not included
-            self.kvno = self.main_part['vno8']
-            self.deleted = self.main_part['size'] < 0
-            len_main = len(self.main_part)
-            if self.size > len_main:
-                self.rest = data[len_main:self.size]
-                if len(self.rest) >= 4 and \
-                        self.rest[:4] != [0, 0, 0, 0]:  # if "field" is present but all 0, it seems to gets ignored
-                    self.kvno = unpack('!L', self.rest[:4])[0]
+        if data is not None:
+            raw_size = unpack('!l', data[:4])[0]
+            self.size = abs(raw_size) + 4  # size field itself not included
+            self.deleted = raw_size < 0
+            body = data[4:self.size]
+            self.principal = KeytabPrincipal(body, version)
+            offset = len(self.principal)
+            self.timestamp = unpack('!L', body[offset:offset + 4])[0]
+            self.vno8 = body[offset + 4]
+            offset += 5
+            self.keyblock = KeyBlock(body[offset:])
+            offset += len(self.keyblock)
+            self.kvno = self.vno8
+            self.rest = body[offset:]
+            if len(self.rest) >= 4 and \
+                    self.rest[:4] != b'\x00\x00\x00\x00':  # if "field" is present but all 0, it seems to gets ignored
+                self.kvno = unpack('!L', self.rest[:4])[0]
         else:
-            self.main_part = self.KeytabEntryMainpart()
-            self.deleted = True
-            self.size = len(self.main_part)
+            self.principal = KeytabPrincipal(version=version)
+            self.timestamp = 0
+            self.vno8 = 0
+            self.keyblock = KeyBlock()
             self.kvno = 0
+            self.deleted = True
+            self.size = None
 
     def __len__(self):
-        return self.size
+        if self.size is not None:
+            return self.size
+        return len(self.getData())
 
     def getData(self):
-        data = self.main_part.getData()
-        if self.rest:
-            data += self.rest
-        return data
+        body = self.principal.getData()
+        body += pack('!L', self.timestamp)
+        body += pack('!B', self.vno8)
+        body += self.keyblock.getData()
+        body += self.rest
+        size = len(body)
+        if self.deleted:
+            size = -size
+        return pack('!l', size) + body
 
     def prettyPrint(self, indent=''):
         if self.deleted:
             return "%s[DELETED]" % indent
         else:
-            text = "%sPrincipal: %s\n" %(indent, self.main_part['principal'].prettyPrint())
-            text += "%sTimestamp: %s" % (indent, datetime.fromtimestamp(self.main_part['timestamp']).isoformat())
+            text = "%sPrincipal: %s\n" % (indent, self.principal.prettyPrint())
+            text += "%sTimestamp: %s" % (indent, datetime.fromtimestamp(self.timestamp).isoformat())
             text += "\tKVNO: %i\n" % self.kvno
-            text += "%sKey: %s" % (indent, self.main_part['keyblock'].prettyPrint())
+            text += "%sKey: %s" % (indent, self.keyblock.prettyPrint())
             #if self.rest:
             #    text += "\n%sRest: %s" % (indent, self.rest)
             return text
@@ -220,16 +253,20 @@ class Keytab:
     def __init__(self, data=None):
         self.miniHeader = None
         self.entries = []
+        self.file_format_version = 0x502
         if data is not None:
             self.miniHeader = self.MiniHeader(data)
+            self.file_format_version = self.miniHeader['file_format_version']
             data = data[len(self.miniHeader):]
             while len(data):
-                entry = KeytabEntry(data)
+                entry = KeytabEntry(data, self.file_format_version)
                 self.entries.append(entry)
                 data = data[len(entry):]
 
     def getData(self):
-        data = self.MiniHeader().getData()
+        miniHeader = self.MiniHeader()
+        miniHeader['file_format_version'] = self.file_format_version
+        data = miniHeader.getData()
         for entry in self.entries:
             data += entry.getData()
         return data
@@ -238,25 +275,33 @@ class Keytab:
         principal = b(principal.upper())
         if ignoreRealm:
             principal = principal.split(b'@')[0]
+        # enctype -> entry with the highest kvno seen so far
         matching_keys = {}
         for entry in self.entries:
-            entry_principal = entry.main_part['principal'].prettyPrint().upper()
+            if entry.deleted:
+                continue
+            entry_principal = entry.principal.prettyPrint().upper()
             if entry_principal == principal or (ignoreRealm and entry_principal.split(b'@')[0] == principal):
-                keytype = entry.main_part["keyblock"]["keytype"]
-                if keytype == specificEncType:
-                    LOG.debug('Returning %s key for %s' % (entry.main_part['keyblock'].prettyKeytype(),
-                                                           entry.main_part['principal'].prettyPrint()))
-                    return entry.main_part["keyblock"]
-                elif specificEncType is None:
+                keytype = entry.keyblock["keytype"]
+                if specificEncType is not None and keytype != specificEncType:
+                    continue
+                current = matching_keys.get(keytype)
+                if current is None or entry.kvno > current.kvno:
                     matching_keys[keytype] = entry
 
-        if specificEncType is None and matching_keys:
+        entry = None
+        if specificEncType is not None:
+            entry = matching_keys.get(specificEncType)
+        else:
             for preference in self.GetkeyEnctypePreference:
                 if preference in matching_keys:
                     entry = matching_keys[preference]
-                    LOG.debug('Returning %s key for %s' % (entry.main_part['keyblock'].prettyKeytype(),
-                                                           entry.main_part['principal'].prettyPrint()))
-                    return entry.main_part["keyblock"]
+                    break
+
+        if entry is not None:
+            LOG.debug('Returning %s key for %s' % (entry.keyblock.prettyKeytype(),
+                                                   entry.principal.prettyPrint()))
+            return entry.keyblock
 
         LOG.debug('Principal %s not found in keytab' % principal)
         return None
@@ -274,9 +319,9 @@ class Keytab:
         keyblock = keytab.getKey("%s@%s" % (username, domain))
         if keyblock:
             if keyblock["keytype"] == Enctype.AES256.value or keyblock["keytype"] == Enctype.AES128.value:
-                options.aesKey = keyblock.hexlifiedValue()
+                options.aesKey = keyblock.hexlifiedValue().decode('ascii')
             elif keyblock["keytype"] == Enctype.RC4.value:
-                options.hashes= ':' + keyblock.hexlifiedValue().decode('ascii')
+                options.hashes = ':' + keyblock.hexlifiedValue().decode('ascii')
         else:
             LOG.warning("No matching key for SPN '%s' in given keytab found!", username)
 

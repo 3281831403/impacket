@@ -146,14 +146,14 @@ class TICKETER:
 
     def loadKeysFromKeytab(self, filename):
         keytab = Keytab.loadFile(filename)
-        keyblock = keytab.getKey("%s@%s" % (options.spn, self.__domain))
+        keyblock = keytab.getKey("%s@%s" % (self.__options.spn, self.__domain))
         if keyblock:
             if keyblock["keytype"] == Enctype.AES256 or keyblock["keytype"] == Enctype.AES128:
-                options.aesKey = keyblock.hexlifiedValue()
+                self.__options.aesKey = keyblock.hexlifiedValue().decode('ascii')
             elif keyblock["keytype"] == Enctype.RC4:
-                options.nthash = keyblock.hexlifiedValue()
+                self.__options.nthash = keyblock.hexlifiedValue().decode('ascii')
         else:
-            logging.warning("No matching key for SPN '%s' in given keytab found!", options.spn)
+            logging.warning("No matching key for SPN '%s' in given keytab found!", self.__options.spn)
 
     def createBasicValidationInfo(self):
         # 1) KERB_VALIDATION_INFO
